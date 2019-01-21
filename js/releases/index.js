@@ -34,6 +34,17 @@ module.exports = {
   },
 
   /**
+   * Associate a commit to release.
+   *
+   * @param {string} commit hash.
+   * @returns {Promise} A promise that resolves when the release associated with commit.
+   * @memberof SentryReleases
+   */
+  setCommits(commit) {
+    return helper.execute(['releases', 'set-commits', '--auto', commit]);
+  },
+
+  /**
    * Marks this release as complete. This should be called once all artifacts has been
    * uploaded.
    *
