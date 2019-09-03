@@ -1,5 +1,94 @@
 # Changelog
 
+## sentry-cli 1.47.1
+
+* Fix potentially broken payloads in `send-event`.
+
+## sentry-cli 1.47.0
+
+* Trim whitespace in header values to prevent potential header injections
+  through the auth token header. (#563)
+* Improved Azure DevOps URL parsing. (#556)
+
+## sentry-cli 1.46.0
+
+* Relax the release file limit for sourcemap uploads when artifact bundles
+  are supported by the serntry server (#559)
+
+## sentry-cli 1.45.0
+
+* Allow ports in VCS urls when associating commits (#551)
+* Support PDB and PE uploads to Sentry (#553)
+
+## sentry-cli 1.44.4
+
+* Emit better version names for react native (#506)
+* Fix a regression in sourcemap uploads for certain release names (#549)
+* Ensure case insensitive git repository matching (#511)
+
+## sentry-cli 1.44.3
+
+* Fix a regression with URL prefixes in sourcemap uploads (#544)
+
+## sentry-cli 1.44.2
+
+* Even faster sourcemap uploads to sentry.io (#540, #542)
+
+## sentry-cli 1.44.1
+
+* Fixed a segfault in curl on empty file uploading (#535)
+
+## sentry-cli 1.44.0
+
+* Parallelize source map uploads (#533)
+
+## sentry-cli 1.43.0
+
+* Add support for File RAM Bundles (#528)
+* Accept more Azure DevOps URLs (#525)
+
+## sentry-cli 1.42.0
+
+* Add support for Indexed RAM Bundles (#523)
+* Add "silent" option to JS constructor (#512)
+
+## sentry-cli 1.41.2
+
+* Fix slow unzipping in debug file upload (#519)
+
+## sentry-cli 1.41.1
+
+* Warn before uploading more than 20.000 files to a release (#513)
+
+## sentry-cli 1.41.0
+
+* Recognizes GNU compressed debug files on Linux
+* Also uploads Breakpad files and ELF files only containing symbol tables
+
+## sentry-cli 1.40.0
+
+* Automatically retry on various socket and SSL errors (#466, #490)
+* Use a connection pool for the outgoing API requests.  This is likely to resolve
+  some issues in curl itself that manifested itself as malloc errors on shutdown (#489)
+* Upgrade internal dependencies and shrink overall binary (#488)
+* Upgrade internal sentry crate
+
+## sentry-cli 1.39.1
+
+* Fix Proguard upload issues on Windows (#484).
+
+## sentry-cli 1.39.0
+
+* Release enabling an internal sentry experiment.
+
+## sentry-cli 1.38.1
+
+* Fix plist parsing
+
+## sentry-cli 1.38.0
+
+* Upgraded symbolic which offers support top R8 code shrinker.
+
 ## sentry-cli 1.37.4
 
 * Added `SENTRY_NO_PROGRESS_BAR` environment variable to suppress progress

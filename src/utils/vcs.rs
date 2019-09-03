@@ -50,7 +50,7 @@ fn parse_rev_range(rng: &str) -> (Option<String>, String) {
     }
     let mut iter = rng.rsplitn(2, "..");
     let rev = iter.next().unwrap_or("HEAD");
-    (iter.next().map(|x| x.to_string()), rev.to_string())
+    (iter.next().map(str::to_owned), rev.to_string())
 }
 
 impl CommitSpec {
@@ -117,22 +117,55 @@ impl VcsUrl {
     }
 
     fn from_git_parts(host: &str, path: &str) -> VcsUrl {
+        // Azure Devops has multiple domains and multiple URL styles for the
+        // various different API versions.
         lazy_static! {
+            static ref AZUREDEV_DOMAIN_RE: Regex =
+                Regex::new(r"^(?:ssh\.)?(dev.azure.com)$").unwrap();
+            static ref AZUREDEV_VERSION_PATH_RE: Regex =
+                Regex::new(r"^v3/([^/]+)/([^/]+)").unwrap();
             static ref VS_DOMAIN_RE: Regex = Regex::new(r"^([^.]+)\.visualstudio.com$").unwrap();
             static ref VS_GIT_PATH_RE: Regex = Regex::new(r"^_git/(.+?)(?:\.git)?$").unwrap();
+            static ref VS_TRAILING_GIT_PATH_RE: Regex = Regex::new(r"^(.+?)/_git").unwrap();
+            static ref HOST_WITH_PORT: Regex = Regex::new(r"(.*):\d+$").unwrap();
+        }
+
+        if let Some(caps) = HOST_WITH_PORT.captures(host) {
+            return VcsUrl::from_git_parts(&caps[1], path);
         }
         if let Some(caps) = VS_DOMAIN_RE.captures(host) {
             let username = &caps[1];
             if let Some(caps) = VS_GIT_PATH_RE.captures(path) {
                 return VcsUrl {
-                    provider: host.into(),
-                    id: format!("{}/{}", username, &caps[1]),
+                    provider: host.to_lowercase(),
+                    id: format!("{}/{}", username.to_lowercase(), &caps[1].to_lowercase()),
+                };
+            }
+            if let Some(caps) = VS_TRAILING_GIT_PATH_RE.captures(path) {
+                return VcsUrl {
+                    provider: host.to_lowercase(),
+                    id: caps[1].to_lowercase(),
+                };
+            }
+        }
+        if let Some(caps) = AZUREDEV_DOMAIN_RE.captures(host) {
+            let hostname = &caps[1];
+            if let Some(caps) = AZUREDEV_VERSION_PATH_RE.captures(path) {
+                return VcsUrl {
+                    provider: hostname.into(),
+                    id: format!("{}/{}", &caps[1].to_lowercase(), &caps[2].to_lowercase()),
+                };
+            }
+            if let Some(caps) = VS_TRAILING_GIT_PATH_RE.captures(path) {
+                return VcsUrl {
+                    provider: hostname.to_lowercase(),
+                    id: caps[1].to_lowercase(),
                 };
             }
         }
         VcsUrl {
-            provider: host.into(),
-            id: strip_git_suffix(path).into(),
+            provider: host.to_lowercase(),
+            id: strip_git_suffix(path).to_lowercase(),
         }
     }
 }
@@ -216,7 +249,7 @@ fn find_matching_rev(
         if let Some(url) = remote.url();
         then {
             if !discovery || is_matching_url(url, &reference_url) {
-            debug!("  found match: {} == {}", url, &reference_url);
+                debug!("  found match: {} == {}", url, &reference_url);
                 let head = repo.revparse_single(r)?;
                 return Ok(Some(log_match!(head.id().to_string())));
             } else {
@@ -382,6 +415,41 @@ fn test_url_parsing() {
         }
     );
     assert_eq!(
+        VcsUrl::parse("https://project@mydomain.visualstudio.com/project/repo/_git"),
+        VcsUrl {
+            provider: "mydomain.visualstudio.com".into(),
+            id: "project/repo".into(),
+        }
+    );
+    assert_eq!(
+        VcsUrl::parse("git@ssh.dev.azure.com:v3/project/repo/repo"),
+        VcsUrl {
+            provider: "dev.azure.com".into(),
+            id: "project/repo".into(),
+        }
+    );
+    assert_eq!(
+        VcsUrl::parse("git@ssh.dev.azure.com:v3/company/Repo%20Online/Repo%20Online"),
+        VcsUrl {
+            provider: "dev.azure.com".into(),
+            id: "company/repo%20online".into(),
+        }
+    );
+    assert_eq!(
+        VcsUrl::parse("https://dev.azure.com/project/repo/_git/repo"),
+        VcsUrl {
+            provider: "dev.azure.com".into(),
+            id: "project/repo".into(),
+        }
+    );
+    assert_eq!(
+        VcsUrl::parse("https://dev.azure.com/company/Repo%20Online/_git/Repo%20Online"),
+        VcsUrl {
+            provider: "dev.azure.com".into(),
+            id: "company/repo%20online".into(),
+        }
+    );
+    assert_eq!(
         VcsUrl::parse("https://github.myenterprise.com/mitsuhiko/flask.git"),
         VcsUrl {
             provider: "github.myenterprise.com".into(),
@@ -415,6 +483,13 @@ fn test_url_parsing() {
             provider: "gitlab.com".into(),
             id: "gitlab-org/gitlab-ce".into(),
         }
+    );
+    assert_eq!(
+        VcsUrl::parse("git@gitlab.com:gitlab-org/GitLab-CE.git"),
+        VcsUrl {
+            provider: "gitlab.com".into(),
+            id: "gitlab-org/gitlab-ce".into(),
+        }
     )
 }
 
@@ -439,5 +514,21 @@ fn test_url_normalization() {
     assert!(is_matching_url(
         "https://gitlab.example.com/gitlab-org/gitlab-ce",
         "git@gitlab.example.com:gitlab-org/gitlab-ce.git"
+    ));
+    assert!(is_matching_url(
+        "https://gitlab.example.com/gitlab-org/GitLab-CE",
+        "git@gitlab.example.com:gitlab-org/gitlab-ce.git"
+    ));
+    assert!(is_matching_url(
+        "https://gitlab.example.com/gitlab-org/GitLab-CE",
+        "ssh://git@gitlab.example.com:22/gitlab-org/GitLab-CE"
+    ));
+    assert!(is_matching_url(
+        "git@ssh.dev.azure.com:v3/project/repo/repo",
+        "https://dev.azure.com/project/repo/_git/repo"
+    ));
+    assert!(is_matching_url(
+        "git@ssh.dev.azure.com:v3/company/Repo%20Online/Repo%20Online",
+        "https://dev.azure.com/company/Repo%20Online/_git/Repo%20Online"
     ))
 }

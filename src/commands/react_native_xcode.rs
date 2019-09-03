@@ -15,7 +15,7 @@ use crate::api::{Api, NewRelease};
 use crate::config::Config;
 use crate::utils::args::ArgExt;
 use crate::utils::fs::TempFile;
-use crate::utils::sourcemaps::SourceMapProcessor;
+use crate::utils::sourcemaps::{SourceMapProcessor, UploadContext};
 use crate::utils::system::propagate_exit_status;
 use crate::utils::xcode::{InfoPlist, MayDetach};
 
@@ -84,6 +84,11 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                 .last(true)
                 .help("Optional arguments to pass to the build script."),
         )
+        .arg(
+            Arg::with_name("wait")
+                .long("wait")
+                .help("Wait for the server to fully process uploaded files."),
+        )
 }
 
 fn find_node() -> String {
@@ -96,9 +101,9 @@ fn find_node() -> String {
 }
 
 pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
-    let config = Config::get_current();
+    let config = Config::current();
     let (org, project) = config.get_org_and_project(matches)?;
-    let api = Api::get_current();
+    let api = Api::current();
     let should_wrap = matches.is_present("force")
         || match env::var("CONFIGURATION") {
             Ok(config) => &config != "Debug",
@@ -178,11 +183,11 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
 
             api.download(
                 &format!("{}/index.ios.bundle?platform=ios&dev=true", url),
-                &mut bundle_file.open(),
+                &mut bundle_file.open()?,
             )?;
             api.download(
                 &format!("{}/index.ios.map?platform=ios&dev=true", url),
-                &mut sourcemap_file.open(),
+                &mut sourcemap_file.open()?,
             )?;
 
         // This is the case where we need to hook into the release process to
@@ -253,13 +258,14 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
                 ..Default::default()
             },
         )?;
-        processor.upload(
-            &api,
-            &org,
-            Some(&project),
-            &release.version,
-            Some(&plist.build()),
-        )?;
+
+        processor.upload(&UploadContext {
+            org: &org,
+            project: Some(&project),
+            release: &release.version,
+            dist: Some(&plist.build()),
+            wait: matches.is_present("wait"),
+        })?;
 
         Ok(())
     })
@@ -270,15 +276,15 @@ pub fn wrap_call() -> Result<(), Error> {
     let mut bundle_path = None;
     let mut sourcemap_path = None;
 
-    if args.len() > 1 && args[1] == "bundle" {
+    if args.len() > 1 && (args[1] == "bundle" || args[1] == "ram-bundle") {
         let mut iter = args.iter().fuse();
         while let Some(item) = iter.next() {
             if item == "--sourcemap-output" {
-                sourcemap_path = iter.next().map(|x| x.to_string());
+                sourcemap_path = iter.next().cloned();
             } else if item.starts_with("--sourcemap-output=") {
                 sourcemap_path = Some(item[19..].to_string());
             } else if item == "--bundle-output" {
-                bundle_path = iter.next().map(|x| x.to_string());
+                bundle_path = iter.next().cloned();
             } else if item.starts_with("--bundle-output=") {
                 bundle_path = Some(item[16..].to_string());
             }

@@ -10,7 +10,6 @@ use std::process;
 use failure::{Error, ResultExt};
 use if_chain::if_chain;
 use lazy_static::lazy_static;
-use plist::serde::deserialize;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -68,7 +67,7 @@ where
         let mut iter = key.splitn(2, ':');
         let value = vars
             .get(iter.next().unwrap())
-            .map(|x| x.as_str())
+            .map(String::as_str)
             .unwrap_or("");
 
         match iter.next() {
@@ -189,7 +188,7 @@ impl InfoPlist {
         if env::var("XCODE_VERSION_ACTUAL").is_ok() {
             let vars: HashMap<_, _> = env::vars().collect();
             if let Some(filename) = vars.get("INFOPLIST_FILE") {
-                let base = vars.get("PROJECT_DIR").map(|x| x.as_str()).unwrap_or(".");
+                let base = vars.get("PROJECT_DIR").map(String::as_str).unwrap_or(".");
                 let path = env::current_dir().unwrap().join(base).join(filename);
                 Ok(Some(InfoPlist::load_and_process(&path, &vars)?))
             } else {
@@ -237,7 +236,7 @@ impl InfoPlist {
         vars: &HashMap<String, String>,
     ) -> Result<InfoPlist, Error> {
         // do we want to preprocess the plist file?
-        let mut rv = if vars.get("INFOPLIST_PREPROCESS").map(|x| x.as_str()) == Some("YES") {
+        let mut rv = if vars.get("INFOPLIST_PREPROCESS").map(String::as_str) == Some("YES") {
             let mut c = process::Command::new("cc");
             c.arg("-xc").arg("-P").arg("-E");
             if let Some(defs) = vars.get("INFOPLIST_PREPROCESSOR_DEFINITIONS") {
@@ -269,8 +268,8 @@ impl InfoPlist {
 
     /// Loads an info plist file from a reader.
     pub fn from_reader<R: SeekRead>(rdr: R) -> Result<InfoPlist, Error> {
-        let mut rdr = BufReader::new(rdr);
-        Ok(deserialize(&mut rdr).context("Could not parse Info.plist file")?)
+        let rdr = BufReader::new(rdr);
+        Ok(plist::from_reader(rdr).context("Could not parse Info.plist file")?)
     }
 
     pub fn get_release_name(&self) -> String {
@@ -482,7 +481,7 @@ pub fn show_notification(title: &str, message: &str) -> Result<(), Error> {
         );
     }
 
-    let config = Config::get_current();
+    let config = Config::current();
     if !config.show_notifications()? {
         return Ok(());
     }

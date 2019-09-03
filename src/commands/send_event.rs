@@ -1,4 +1,5 @@
 //! Implements a command for sending events to Sentry.
+use std::borrow::Cow;
 use std::env;
 
 use clap::{App, Arg, ArgMatches};
@@ -132,7 +133,7 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
 }
 
 pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
-    let config = Config::get_current();
+    let config = Config::current();
     let mut event = Event::default();
 
     event.sdk = Some(get_sdk_info());
@@ -145,7 +146,7 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
     if let Some(release) = matches.value_of("release") {
         event.release = Some(release.to_string().into());
     } else {
-        event.release = detect_release_name().ok().map(|r| r.into());
+        event.release = detect_release_name().ok().map(Cow::from);
     }
 
     event.dist = matches.value_of("dist").map(|x| x.to_string().into());

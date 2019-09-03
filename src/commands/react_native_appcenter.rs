@@ -11,7 +11,7 @@ use crate::api::{Api, NewRelease};
 use crate::config::Config;
 use crate::utils::appcenter::{get_appcenter_package, get_react_native_appcenter_release};
 use crate::utils::args::ArgExt;
-use crate::utils::sourcemaps::SourceMapProcessor;
+use crate::utils::sourcemaps::{SourceMapProcessor, UploadContext};
 
 pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
     app.about("Upload react-native projects for AppCenter.")
@@ -33,6 +33,12 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                      codepush releases for Android when you use different \
                      bundle IDs for release and debug etc.",
                 ),
+        )
+        .arg(
+            Arg::with_name("version_name")
+                .value_name("VERSION_NAME")
+                .long("version-name")
+                .help("Override version name in release name"),
         )
         .arg(
             Arg::with_name("print_release_name")
@@ -61,17 +67,22 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                 .multiple(true)
                 .help("A list of folders with assets that should be processed."),
         )
+        .arg(
+            Arg::with_name("wait")
+                .long("wait")
+                .help("Wait for the server to fully process uploaded files."),
+        )
 }
 
 pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
-    let config = Config::get_current();
+    let config = Config::current();
     let here = env::current_dir()?;
     let here_str: &str = &here.to_string_lossy();
     let (org, project) = config.get_org_and_project(matches)?;
     let app = matches.value_of("app_name").unwrap();
     let platform = matches.value_of("platform").unwrap();
     let deployment = matches.value_of("deployment").unwrap_or("Staging");
-    let api = Api::get_current();
+    let api = Api::current();
     let print_release_name = matches.is_present("print_release_name");
 
     if !print_release_name {
@@ -82,8 +93,12 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
     }
 
     let package = get_appcenter_package(app, deployment)?;
-    let release =
-        get_react_native_appcenter_release(&package, platform, matches.value_of("bundle_id"))?;
+    let release = get_react_native_appcenter_release(
+        &package,
+        platform,
+        matches.value_of("bundle_id"),
+        matches.value_of("version_name"),
+    )?;
     if print_release_name {
         println!("{}", release);
         return Ok(());
@@ -123,7 +138,14 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
             ..Default::default()
         },
     )?;
-    processor.upload(&api, &org, Some(&project), &release.version, None)?;
+
+    processor.upload(&UploadContext {
+        org: &org,
+        project: Some(&project),
+        release: &release.version,
+        dist: None,
+        wait: !matches.is_present("wait"),
+    })?;
 
     Ok(())
 }

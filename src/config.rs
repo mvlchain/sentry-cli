@@ -11,7 +11,7 @@ use failure::{bail, err_msg, Error, ResultExt};
 use ini::Ini;
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use sentry::Dsn;
+use sentry::internals::Dsn;
 
 use crate::constants::{CONFIG_RC_FILE_NAME, DEFAULT_RETRIES, DEFAULT_URL};
 use crate::utils::logging::set_max_level;
@@ -64,17 +64,17 @@ impl Config {
             let mut cfg = CONFIG.lock();
             *cfg = Some(Arc::new(self));
         }
-        Config::get_current()
+        Config::current()
     }
 
     /// Return the currently bound config as option.
-    pub fn get_current_opt() -> Option<Arc<Config>> {
+    pub fn current_opt() -> Option<Arc<Config>> {
         CONFIG.lock().as_ref().cloned()
     }
 
     /// Return the currently bound config.
-    pub fn get_current() -> Arc<Config> {
-        Config::get_current_opt().expect("Config not bound yet")
+    pub fn current() -> Arc<Config> {
+        Config::current_opt().expect("Config not bound yet")
     }
 
     /// Makes a copy of the config in a closure and boxes it.
@@ -256,12 +256,12 @@ impl Config {
     pub fn get_org(&self, matches: &ArgMatches<'_>) -> Result<String, Error> {
         Ok(matches
             .value_of("org")
-            .map(|x| x.to_owned())
+            .map(str::to_owned)
             .or_else(|| env::var("SENTRY_ORG").ok())
             .or_else(|| {
                 self.ini
                     .get_from(Some("defaults"), "org")
-                    .map(|x| x.to_owned())
+                    .map(str::to_owned)
             })
             .ok_or_else(|| err_msg("An organization slug is required (provide with --org)"))?)
     }
@@ -286,7 +286,7 @@ impl Config {
             .or_else(|| {
                 self.ini
                     .get_from(Some("defaults"), "project")
-                    .map(|x| x.to_owned())
+                    .map(str::to_owned)
             })
             .ok_or_else(|| err_msg("A project slug is required"))?)
     }
@@ -297,12 +297,12 @@ impl Config {
             env::var("SENTRY_ORG").ok().or_else(|| {
                 self.ini
                     .get_from(Some("defaults"), "org")
-                    .map(|x| x.to_owned())
+                    .map(str::to_owned)
             }),
             env::var("SENTRY_PROJECT").ok().or_else(|| {
                 self.ini
                     .get_from(Some("defaults"), "project")
-                    .map(|x| x.to_owned())
+                    .map(str::to_owned)
             }),
         )
     }

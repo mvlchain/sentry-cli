@@ -16,25 +16,27 @@ where
     F: FnOnce() -> (),
     F: Send + 'static,
 {
-    use chan::chan_select;
-    use chan_signal::{notify, Signal};
+    let (tx, rx) = crossbeam_channel::bounded(100);
+    let signals =
+        signal_hook::iterator::Signals::new(&[signal_hook::SIGTERM, signal_hook::SIGINT]).unwrap();
 
-    let run = |_sdone: chan::Sender<()>| f();
-    let signal = notify(&[Signal::INT, Signal::TERM]);
-    let (sdone, rdone) = chan::sync(0);
-    std::thread::spawn(move || run(sdone));
-
-    let mut rv = None;
-
-    chan_select! {
-        signal.recv() -> signal => { rv = signal; },
-        rdone.recv() => {}
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            f();
+            tx.send(0).ok();
+        });
     }
 
-    if let Some(signal) = rv {
-        use chan_signal::Signal;
-        if signal == Signal::INT {
-            println!("Interrupted!");
+    std::thread::spawn(move || {
+        for signal in signals.forever() {
+            tx.send(signal).ok();
+        }
+    });
+
+    if let Ok(signal) = rx.recv() {
+        if signal == signal_hook::SIGINT {
+            eprintln!("Interrupted!");
         }
     }
 }
@@ -123,7 +125,7 @@ pub fn print_error(err: &Error) {
         }
     }
 
-    if Config::get_current().get_log_level() < log::LevelFilter::Info {
+    if Config::current().get_log_level() < log::LevelFilter::Info {
         eprintln!();
         eprintln!("{}", style("Add --log-level=[info|debug] or export SENTRY_LOG_LEVEL=[info|debug] to see more output.").dim());
         eprintln!(
@@ -183,7 +185,7 @@ pub fn init_backtrace() {
 
 #[cfg(target_os = "macos")]
 pub fn get_model() -> Option<String> {
-    if let Some(model) = Config::get_current().get_model() {
+    if let Some(model) = Config::current().get_model() {
         return Some(model);
     }
 
@@ -212,12 +214,11 @@ pub fn get_model() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 pub fn get_family() -> Option<String> {
-    if let Some(family) = Config::get_current().get_family() {
+    if let Some(family) = Config::current().get_family() {
         return Some(family);
     }
 
     use if_chain::if_chain;
-    use regex::Regex;
 
     lazy_static! {
         static ref FAMILY_RE: Regex = Regex::new(r#"([a-zA-Z]+)\d"#).unwrap();
@@ -237,12 +238,12 @@ pub fn get_family() -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn get_model() -> Option<String> {
-    Config::get_current().get_model()
+    Config::current().get_model()
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn get_family() -> Option<String> {
-    Config::get_current().get_family()
+    Config::current().get_family()
 }
 
 /// Indicates that sentry-cli should quit without printing anything.

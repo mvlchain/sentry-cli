@@ -5,7 +5,7 @@
 
 # Official Sentry Command Line Interface
 
-[![Travis](https://img.shields.io/travis/getsentry/sentry-cli.svg)](https://travis-ci.org/getsentry/sentry-cli)
+[![Travis](https://img.shields.io/travis/com/getsentry/sentry-cli.svg)](https://travis-ci.com/getsentry/sentry-cli)
 [![AppVeyor](https://img.shields.io/appveyor/ci/sentry/sentry-cli.svg)](https://ci.appveyor.com/project/sentry/sentry-cli)
 [![GitHub release](https://img.shields.io/github/release/getsentry/sentry-cli.svg)](https://github.com/getsentry/sentry-cli/releases/latest)
 [![npm version](https://img.shields.io/npm/v/@sentry/cli.svg)](https://www.npmjs.com/package/@sentry/cli)
@@ -85,7 +85,7 @@ docker run --rm -v $(pwd):/work getsentry/sentry-cli --help
 In case you want to compile this yourself, you need to install at minimum the
 following dependencies:
 
-* Rust 1.23 and Cargo
+* Rust stable and Cargo
 * Make, CMake and a C compiler
 * OpenSSL 1.0.2n with development headers
 * Curl 7.50 with development headers

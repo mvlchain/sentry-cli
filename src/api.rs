@@ -4,17 +4,16 @@
 //! sentry-cli tool.
 
 use std::borrow::Cow;
-use std::cell::{RefCell, RefMut};
-use std::cmp;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::rc::Rc;
-use std::str;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::thread;
 
 use backoff::backoff::Backoff;
 use brotli2::write::BrotliEncoder;
@@ -24,14 +23,15 @@ use flate2::write::GzEncoder;
 use if_chain::if_chain;
 use lazy_static::lazy_static;
 use log::{debug, info, warn};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use regex::{Captures, Regex};
 use serde::de::{DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use symbolic::common::types::ObjectClass;
-use symbolic::debuginfo::DebugId;
+use symbolic::common::DebugId;
+use symbolic::debuginfo::ObjectKind;
 use url::percent_encoding::{utf8_percent_encode, DEFAULT_ENCODE_SET, QUERY_ENCODE_SET};
+use uuid::Uuid;
 
 use crate::config::{Auth, Config};
 use crate::constants::{ARCH, EXT, PLATFORM, RELEASE_REGISTRY_LATEST_URL, VERSION};
@@ -49,8 +49,27 @@ pub struct PathArg<A: fmt::Display>(A);
 /// Wrapper that escapes arguments for URL query segments.
 pub struct QueryArg<A: fmt::Display>(A);
 
-thread_local! {
-    static API: Rc<Api> = Rc::new(Api::new());
+struct CurlConnectionManager;
+
+impl r2d2::ManageConnection for CurlConnectionManager {
+    type Connection = curl::easy::Easy;
+    type Error = curl::Error;
+
+    fn connect(&self) -> Result<curl::easy::Easy, curl::Error> {
+        Ok(curl::easy::Easy::new())
+    }
+
+    fn is_valid(&self, _conn: &mut curl::easy::Easy) -> Result<(), curl::Error> {
+        Ok(())
+    }
+
+    fn has_broken(&self, _conn: &mut curl::easy::Easy) -> bool {
+        false
+    }
+}
+
+lazy_static! {
+    static ref API: Mutex<Option<Arc<Api>>> = Mutex::new(None);
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +90,7 @@ impl Pagination {
     }
 }
 
-impl str::FromStr for Pagination {
+impl FromStr for Pagination {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Pagination, ()> {
@@ -152,13 +171,7 @@ impl ProgressBarMode {
 /// Helper for the API access.
 pub struct Api {
     config: Arc<Config>,
-    shared_handle: RefCell<curl::easy::Easy>,
-}
-
-impl Drop for Api {
-    fn drop(&mut self) {
-        self.reset();
-    }
+    pool: r2d2::Pool<CurlConnectionManager>,
 }
 
 /// Represents file contents temporarily
@@ -176,7 +189,7 @@ pub struct SentryError {
 
 impl fmt::Display for SentryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let detail = self.detail.as_ref().map(|x| x.as_str()).unwrap_or("");
+        let detail = self.detail.as_ref().map(String::as_str).unwrap_or("");
         write!(
             f,
             "sentry reported an error: {} (http status: {})",
@@ -217,6 +230,8 @@ pub enum ApiErrorKind {
     BadApiUrl,
     #[fail(display = "organization not found")]
     OrganizationNotFound,
+    #[fail(display = "resource not found")]
+    ResourceNotFound,
     #[fail(display = "project not found")]
     ProjectNotFound,
     #[fail(display = "release not found")]
@@ -316,8 +331,8 @@ impl fmt::Display for Method {
 
 /// Represents an API request.  This can be customized before
 /// sending but only sent once.
-pub struct ApiRequest<'a> {
-    handle: RefMut<'a, curl::easy::Easy>,
+pub struct ApiRequest {
+    handle: r2d2::PooledConnection<CurlConnectionManager>,
     headers: curl::easy::List,
     body: Option<Vec<u8>>,
     progress_bar_mode: ProgressBarMode,
@@ -333,33 +348,27 @@ pub struct ApiResponse {
     body: Option<Vec<u8>>,
 }
 
-impl Default for Api {
-    fn default() -> Self {
-        Api::new()
-    }
-}
-
 impl Api {
-    /// Creates a new API access helper.  For as long as it lives HTTP
-    /// keepalive can be used.  When the object is recreated new
-    /// connections will be established.
-    pub fn new() -> Api {
-        Api::with_config(Config::get_current())
-    }
-
     /// Returns the current api for the thread.
     ///
     /// Threads other than the main thread must call `Api::reset` when
     /// shutting down to prevent `process::exit` from hanging afterwards.
-    pub fn get_current() -> Rc<Api> {
-        API.with(|api| api.clone())
+    pub fn current() -> Arc<Api> {
+        let mut api_opt = API.lock();
+        if let Some(ref api) = *api_opt {
+            api.clone()
+        } else {
+            let api = Arc::new(Api::with_config(Config::current()));
+            *api_opt = Some(api.clone());
+            api
+        }
     }
 
-    /// Returns the current api for the thread if bound.
-    pub fn get_current_opt() -> Option<Rc<Api>> {
-        // `Api::get_current` fails if there is no config yet.
-        if Config::get_current_opt().is_some() {
-            Some(Api::get_current())
+    /// Returns the current api.
+    pub fn current_opt() -> Option<Arc<Api>> {
+        // `Api::current` fails if there is no config yet.
+        if Config::current_opt().is_some() {
+            Some(Api::current())
         } else {
             None
         }
@@ -369,23 +378,26 @@ impl Api {
     pub fn with_config(config: Arc<Config>) -> Api {
         Api {
             config,
-            shared_handle: RefCell::new(curl::easy::Easy::new()),
+            pool: r2d2::Pool::builder()
+                .max_size(16)
+                .build(CurlConnectionManager)
+                .unwrap(),
         }
     }
 
-    // Low Level Methods
-
-    /// Resets the curl handle of this API client.
-    pub fn reset(&self) {
-        *self.shared_handle.borrow_mut() = curl::easy::Easy::new();
+    /// Utility method that unbinds the current api.
+    pub fn dispose_pool() {
+        *API.lock() = None;
     }
+
+    // Low Level Methods
 
     /// Create a new `ApiRequest` for the given HTTP method and URL.  If the
     /// URL is just a path then it's relative to the configured API host
     /// and authentication is automatically enabled.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn request<'a>(&'a self, method: Method, url: &str) -> ApiResult<ApiRequest<'a>> {
-        let mut handle = self.shared_handle.borrow_mut();
+    pub fn request(&self, method: Method, url: &str) -> ApiResult<ApiRequest> {
+        let mut handle = self.pool.get().unwrap();
         handle.reset();
         if !self.config.allow_keepalive() {
             handle.forbid_reuse(true).ok();
@@ -448,7 +460,7 @@ impl Api {
     }
 
     /// Convenience method that downloads a file into the given file object.
-    pub fn download(&self, url: &str, dst: &mut fs::File) -> ApiResult<ApiResponse> {
+    pub fn download(&self, url: &str, dst: &mut File) -> ApiResult<ApiResponse> {
         self.request(Method::Get, &url)?
             .follow_location(true)?
             .send_into(dst)
@@ -456,7 +468,7 @@ impl Api {
 
     /// Convenience method that downloads a file into the given file object
     /// and show a progress bar
-    pub fn download_with_progress(&self, url: &str, dst: &mut fs::File) -> ApiResult<ApiResponse> {
+    pub fn download_with_progress(&self, url: &str, dst: &mut File) -> ApiResult<ApiResponse> {
         self.request(Method::Get, &url)?
             .follow_location(true)?
             .progress_bar_mode(ProgressBarMode::Response)?
@@ -476,7 +488,7 @@ impl Api {
                     }
                 }
             }
-            thread::sleep(Duration::milliseconds(500).to_std().unwrap());
+            std::thread::sleep(Duration::milliseconds(500).to_std().unwrap());
             if Utc::now() - duration > started {
                 return Ok(false);
             }
@@ -579,6 +591,7 @@ impl Api {
         name: &str,
         dist: Option<&str>,
         headers: Option<&[(String, String)]>,
+        progress_bar_mode: ProgressBarMode,
     ) -> ApiResult<Option<Artifact>> {
         let path = if let Some(project) = project {
             format!(
@@ -602,7 +615,7 @@ impl Api {
             FileContents::FromBytes(bytes) => {
                 let filename = Path::new(name)
                     .file_name()
-                    .and_then(|x| x.to_str())
+                    .and_then(OsStr::to_str)
                     .unwrap_or("unknown.bin");
                 form.part("file").buffer(filename, bytes.to_vec()).add()?;
             }
@@ -631,7 +644,7 @@ impl Api {
                     http::HTTP_STATUS_504_GATEWAY_TIMEOUT,
                 ],
             )?
-            .progress_bar_mode(ProgressBarMode::Request)?
+            .progress_bar_mode(progress_bar_mode)?
             .send()?;
         if resp.status() == 409 {
             Ok(None)
@@ -905,7 +918,7 @@ impl Api {
 
     /// Get the server configuration for chunked file uploads.
     pub fn get_chunk_upload_options(&self, org: &str) -> ApiResult<Option<ChunkUploadOptions>> {
-        let url = format!("/organizations/{}/chunk-upload/", org);
+        let url = format!("/organizations/{}/chunk-upload/", PathArg(org));
         match self
             .get(&url)?
             .convert_rnf(ApiErrorKind::ChunkUploadNotSupported)
@@ -928,7 +941,12 @@ impl Api {
         project: &str,
         request: &AssembleDifsRequest<'_>,
     ) -> ApiResult<AssembleDifsResponse> {
-        let url = format!("/projects/{}/{}/files/difs/assemble/", org, project);
+        let url = format!(
+            "/projects/{}/{}/files/difs/assemble/",
+            PathArg(org),
+            PathArg(project)
+        );
+
         self.request(Method::Post, &url)?
             .with_json_body(request)?
             .with_retry(
@@ -941,6 +959,33 @@ impl Api {
             )?
             .send()?
             .convert_rnf(ApiErrorKind::ProjectNotFound)
+    }
+
+    pub fn assemble_artifacts(
+        &self,
+        org: &str,
+        release: &str,
+        checksum: Digest,
+        chunks: &[Digest],
+    ) -> ApiResult<AssembleArtifactsResponse> {
+        let url = format!(
+            "/organizations/{}/releases/{}/assemble/",
+            PathArg(org),
+            PathArg(release)
+        );
+
+        self.request(Method::Post, &url)?
+            .with_json_body(&ChunkedArtifactRequest { checksum, chunks })?
+            .with_retry(
+                self.config.get_max_retry_count().unwrap(),
+                &[
+                    http::HTTP_STATUS_502_BAD_GATEWAY,
+                    http::HTTP_STATUS_503_SERVICE_UNAVAILABLE,
+                    http::HTTP_STATUS_504_GATEWAY_TIMEOUT,
+                ],
+            )?
+            .send()?
+            .convert_rnf(ApiErrorKind::ReleaseNotFound)
     }
 
     /// Compresses a file with the given compression.
@@ -979,7 +1024,7 @@ impl Api {
         // has completed. The original iterator is not needed anymore after this.
         let stringified_chunks: Vec<_> = chunks
             .into_iter()
-            .map(|item| item.as_ref())
+            .map(T::as_ref)
             .map(|&(checksum, data)| (checksum.to_string(), data))
             .collect();
 
@@ -1008,7 +1053,7 @@ impl Api {
         // not add the authorization header, by default. Since the URL is guaranteed
         // to be a Sentry-compatible endpoint, we force the Authorization header at
         // this point.
-        let request = match Config::get_current().get_auth() {
+        let request = match Config::current().get_auth() {
             Some(auth) => request.with_auth(auth)?,
             None => request,
         };
@@ -1107,6 +1152,67 @@ impl Api {
         } else {
             resp.into_result().map(|_| true)
         }
+    }
+
+    /// List all monitors associated with an organization
+    pub fn list_organization_monitors(&self, org: &str) -> ApiResult<Vec<Monitor>> {
+        let mut rv = vec![];
+        let mut cursor = "".to_string();
+        loop {
+            let resp = self.get(&format!(
+                "/organizations/{}/monitors/?cursor={}",
+                PathArg(org),
+                QueryArg(&cursor)
+            ))?;
+            if resp.status() == 404 {
+                if rv.is_empty() {
+                    return Err(ApiErrorKind::ResourceNotFound.into());
+                } else {
+                    break;
+                }
+            }
+            let pagination = resp.pagination();
+            rv.extend(resp.convert::<Vec<Monitor>>()?.into_iter());
+            if let Some(next) = pagination.into_next_cursor() {
+                cursor = next;
+            } else {
+                break;
+            }
+        }
+        Ok(rv)
+    }
+
+    /// Create a new checkin for a monitor
+    pub fn create_monitor_checkin(
+        &self,
+        monitor: &Uuid,
+        checkin: &CreateMonitorCheckIn,
+    ) -> ApiResult<MonitorCheckIn> {
+        let path = &format!("/monitors/{}/checkins/", PathArg(monitor),);
+        let resp = self.post(&path, checkin)?;
+        if resp.status() == 404 {
+            return Err(ApiErrorKind::ResourceNotFound.into());
+        }
+        resp.convert()
+    }
+
+    /// Update a checkin for a monitor
+    pub fn update_monitor_checkin(
+        &self,
+        monitor: &Uuid,
+        checkin_id: &Uuid,
+        checkin: &UpdateMonitorCheckIn,
+    ) -> ApiResult<MonitorCheckIn> {
+        let path = &format!(
+            "/monitors/{}/checkins/{}/",
+            PathArg(monitor),
+            PathArg(checkin_id),
+        );
+        let resp = self.put(&path, checkin)?;
+        if resp.status() == 404 {
+            return Err(ApiErrorKind::ResourceNotFound.into());
+        }
+        resp.convert()
     }
 
     /// List all projects associated with an organization
@@ -1292,9 +1398,9 @@ impl<'a> Iterator for Headers<'a> {
     }
 }
 
-impl<'a> ApiRequest<'a> {
+impl ApiRequest {
     fn create(
-        mut handle: RefMut<'a, curl::easy::Easy>,
+        mut handle: r2d2::PooledConnection<CurlConnectionManager>,
         method: &Method,
         url: &str,
         auth: Option<&Auth>,
@@ -1344,19 +1450,18 @@ impl<'a> ApiRequest<'a> {
             Auth::Key(ref key) => {
                 self.handle.username(key)?;
                 debug!("using key based authentication");
+                Ok(self)
             }
             Auth::Token(ref token) => {
-                self.headers
-                    .append(&format!("Authorization: Bearer {}", token))?;
                 debug!("using token authentication");
+                self.with_header("Authorization", &format!("Bearer {}", token))
             }
         }
-
-        Ok(self)
     }
 
     /// adds a specific header to the request
     pub fn with_header(mut self, key: &str, value: &str) -> ApiResult<Self> {
+        let value = value.trim().lines().next().unwrap_or("");
         self.headers.append(&format!("{}: {}", key, value))?;
         Ok(self)
     }
@@ -1418,7 +1523,7 @@ impl<'a> ApiRequest<'a> {
     pub fn send_into<W: Write>(&mut self, out: &mut W) -> ApiResult<ApiResponse> {
         let headers = self.get_headers();
         self.handle.http_headers(headers)?;
-        let body = self.body.as_ref().map(|v| v.as_slice());
+        let body = self.body.as_ref().map(Vec::as_slice);
         let (status, headers) =
             send_req(&mut self.handle, out, body, self.progress_bar_mode.clone())?;
         debug!("response status: {}", status);
@@ -1454,7 +1559,7 @@ impl<'a> ApiRequest<'a> {
                 retry_number,
                 backoff_timeout.as_milliseconds()
             );
-            thread::sleep(backoff_timeout);
+            std::thread::sleep(backoff_timeout);
 
             retry_number += 1;
         }
@@ -1600,7 +1705,7 @@ fn log_headers(is_response: bool, data: &[u8]) {
     lazy_static! {
         static ref AUTH_RE: Regex = Regex::new(r"(?i)(authorization):\s*([\w]+)\s+(.*)").unwrap();
     }
-    if let Ok(header) = str::from_utf8(data) {
+    if let Ok(header) = std::str::from_utf8(data) {
         for line in header.lines() {
             if line.is_empty() {
                 continue;
@@ -1610,7 +1715,7 @@ fn log_headers(is_response: bool, data: &[u8]) {
                 let info = if &caps[1].to_lowercase() == "basic" {
                     caps[3].split(':').next().unwrap().to_string()
                 } else {
-                    format!("{}***", &caps[3][..cmp::min(caps[3].len(), 8)])
+                    format!("{}***", &caps[3][..std::cmp::min(caps[3].len(), 8)])
                 };
                 format!("{}: {} {}", &caps[1], &caps[2], info)
             });
@@ -1754,7 +1859,7 @@ pub struct SentryCliRelease {
 #[derive(Debug, Deserialize, Default)]
 pub struct DebugInfoData {
     #[serde(default, rename = "type")]
-    pub class: Option<ObjectClass>,
+    pub kind: Option<ObjectKind>,
     #[serde(default)]
     pub features: Vec<String>,
 }
@@ -1865,6 +1970,42 @@ pub struct Project {
     pub team: Team,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct Monitor {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorStatus {
+    Unknown,
+    Ok,
+    InProgress,
+    Error,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MonitorCheckIn {
+    pub id: Uuid,
+    pub status: MonitorStatus,
+    pub duration: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateMonitorCheckIn {
+    pub status: MonitorStatus,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct UpdateMonitorCheckIn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<MonitorStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct RepoProvider {
     pub id: String,
@@ -1960,24 +2101,67 @@ impl<'de> Deserialize<'de> for ChunkCompression {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkUploadCapability {
+    /// Chunked upload of debug files
+    DebugFiles,
+
+    /// Chunked upload of release files
+    ReleaseFiles,
+
+    /// Upload of PDBs and debug id overrides
+    Pdbs,
+
+    /// Uploads of source archives
+    Sources,
+
+    /// Any other unsupported capability (ignored)
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for ChunkUploadCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "debug_files" => ChunkUploadCapability::DebugFiles,
+            "release_files" => ChunkUploadCapability::ReleaseFiles,
+            "pdbs" => ChunkUploadCapability::Pdbs,
+            "sources" => ChunkUploadCapability::Sources,
+            _ => ChunkUploadCapability::Unknown,
+        })
+    }
+}
+
+fn default_chunk_upload_accept() -> Vec<ChunkUploadCapability> {
+    vec![ChunkUploadCapability::DebugFiles]
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChunkUploadOptions {
-    #[serde(rename = "url")]
     pub url: String,
     #[serde(rename = "chunksPerRequest")]
     pub max_chunks: u64,
     #[serde(rename = "maxRequestSize")]
     pub max_size: u64,
-    #[serde(rename = "maxFileSize", default)]
+    #[serde(default)]
     pub max_file_size: u64,
-    #[serde(rename = "hashAlgorithm")]
     pub hash_algorithm: ChunkHashAlgorithm,
-    #[serde(rename = "chunkSize")]
     pub chunk_size: u64,
-    #[serde(rename = "concurrency")]
     pub concurrency: u8,
-    #[serde(rename = "compression", default)]
+    #[serde(default)]
     pub compression: Vec<ChunkCompression>,
+    #[serde(default = "default_chunk_upload_accept")]
+    pub accept: Vec<ChunkUploadCapability>,
+}
+
+impl ChunkUploadOptions {
+    /// Returns whether the given capability is accepted by the chunk upload endpoint.
+    pub fn supports(&self, capability: ChunkUploadCapability) -> bool {
+        self.accept.contains(&capability)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -2010,23 +2194,34 @@ impl ChunkedFileState {
 
 #[derive(Debug, Serialize)]
 pub struct ChunkedDifRequest<'a> {
-    #[serde(rename = "name")]
     pub name: &'a str,
-    #[serde(rename = "chunks")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_id: Option<DebugId>,
     pub chunks: &'a [Digest],
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChunkedDifResponse {
-    #[serde(rename = "state")]
     pub state: ChunkedFileState,
-    #[serde(rename = "missingChunks")]
     pub missing_chunks: Vec<Digest>,
-    #[serde(default, rename = "detail")]
     pub detail: Option<String>,
-    #[serde(default, rename = "dif")]
     pub dif: Option<DebugInfoFile>,
 }
 
 pub type AssembleDifsRequest<'a> = HashMap<Digest, ChunkedDifRequest<'a>>;
 pub type AssembleDifsResponse = HashMap<Digest, ChunkedDifResponse>;
+
+#[derive(Debug, Serialize)]
+pub struct ChunkedArtifactRequest<'a> {
+    pub checksum: Digest,
+    pub chunks: &'a [Digest],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssembleArtifactsResponse {
+    pub state: ChunkedFileState,
+    pub missing_chunks: Vec<Digest>,
+    pub detail: Option<String>,
+}

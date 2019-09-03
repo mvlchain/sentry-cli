@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use clap::{App, Arg, ArgMatches};
 use console::style;
 use failure::{bail, Error, SyncFailure};
-use symbolic::common::byteview::ByteView;
+use log::debug;
+use symbolic::common::ByteView;
 use symbolic::proguard::ProguardMappingView;
 use uuid::Uuid;
 
@@ -131,7 +132,7 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
 }
 
 pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
-    let api = Api::get_current();
+    let api = Api::current();
 
     let paths: Vec<_> = match matches.values_of("paths") {
         Some(paths) => paths.collect(),
@@ -163,7 +164,7 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
     for path in &paths {
         match fs::metadata(path) {
             Ok(md) => {
-                let byteview = ByteView::from_path(path).map_err(SyncFailure::new)?;
+                let byteview = ByteView::open(path).map_err(SyncFailure::new)?;
                 let mapping = ProguardMappingView::parse(byteview).map_err(SyncFailure::new)?;
                 if !mapping.has_line_info() {
                     eprintln!(
@@ -173,7 +174,9 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
                     );
                 } else {
                     let mut f = fs::File::open(path)?;
-                    all_checksums.push(get_sha1_checksum(&mut f)?.to_string());
+                    let sha = get_sha1_checksum(&mut f)?.to_string();
+                    debug!("SHA1 for mapping file '{}': '{}'", path, sha);
+                    all_checksums.push(sha);
                     mappings.push(MappingRef {
                         path: PathBuf::from(path),
                         size: md.len(),
@@ -205,10 +208,9 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
 
     println!("{} compressing mappings", style(">").dim());
     let tf = TempFile::create()?;
-
-    // add a scope here so we will flush before uploading
     {
-        let mut zip = zip::ZipWriter::new(tf.open());
+        let mut zip = zip::ZipWriter::new(tf.open()?);
+
         for mapping in &mappings {
             let pb = make_byte_progress_bar(mapping.size);
             zip.start_file(
@@ -232,7 +234,7 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
     }
 
     println!("{} uploading mappings", style(">").dim());
-    let config = Config::get_current();
+    let config = Config::current();
     let (org, project) = config.get_org_and_project(matches)?;
     let rv = api.upload_dif_archive(&org, &project, tf.path())?;
     println!(
@@ -264,8 +266,8 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
                 checksums: all_checksums,
                 name: app_id.to_string(),
                 app_id: app_id.to_string(),
-                version: matches.value_of("version").unwrap().to_string(),
-                build: matches.value_of("version_code").map(|x| x.to_string()),
+                version: matches.value_of("version").unwrap().to_owned(),
+                build: matches.value_of("version_code").map(str::to_owned),
             },
         )?;
     }

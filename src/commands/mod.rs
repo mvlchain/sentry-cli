@@ -30,6 +30,7 @@ macro_rules! each_subcommand {
         $mac!(issues);
         $mac!(repos);
         $mac!(projects);
+        $mac!(monitors);
         #[cfg(not(feature = "managed"))]
         $mac!(update);
         #[cfg(not(feature = "managed"))]
@@ -52,7 +53,7 @@ macro_rules! each_subcommand {
 
 // commands we want to run the update nagger on
 const UPDATE_NAGGER_CMDS: &[&str] = &[
-    "releases", "issues", "repos", "projects", "info", "login", "difutil",
+    "releases", "issues", "repos", "projects", "monitors", "info", "login", "difutil",
 ];
 
 // it would be great if this could be a macro expansion as well
@@ -61,6 +62,7 @@ pub mod bash_hook;
 pub mod info;
 pub mod issues;
 pub mod login;
+pub mod monitors;
 pub mod projects;
 pub mod releases;
 pub mod repos;
@@ -79,6 +81,7 @@ pub mod react_native_gradle;
 pub mod react_native_xcode;
 
 pub mod difutil;
+pub mod difutil_bundle_sources;
 pub mod difutil_check;
 pub mod difutil_find;
 pub mod difutil_id;
@@ -149,7 +152,7 @@ fn add_commands<'a, 'b>(mut app: App<'a, 'b>) -> App<'a, 'b> {
     app
 }
 
-#[allow(clippy::cyclomatic_complexity)]
+#[allow(clippy::cognitive_complexity)]
 fn run_command(matches: &ArgMatches<'_>) -> Result<(), Error> {
     macro_rules! execute_subcommand {
         ($name:ident) => {{
@@ -237,7 +240,7 @@ pub fn execute(args: &[String]) -> Result<(), Error> {
     config.bind_to_process();
     info!(
         "Loaded config from {}",
-        Config::get_current().get_filename().display()
+        Config::current().get_filename().display()
     );
 
     debug!(
@@ -247,7 +250,7 @@ pub fn execute(args: &[String]) -> Result<(), Error> {
 
     info!(
         "sentry-cli was invoked with the following command line: {}",
-        DebugArgs(args.iter().map(|x| x.as_str()).collect())
+        DebugArgs(args.iter().map(String::as_str).collect())
     );
 
     run_command(&matches)
@@ -296,23 +299,25 @@ pub fn main() {
     setup();
     let result = run();
 
-    if let Some(api) = Api::get_current_opt() {
-        api.reset();
-    }
-
-    match result {
-        Ok(()) => process::exit(0),
+    let status_code = match result {
+        Ok(()) => 0,
         Err(err) => {
             if let Some(&QuietExit(code)) = err.downcast_ref() {
-                process::exit(code);
+                code
             } else {
                 print_error(&err);
                 #[cfg(feature = "with_crash_reporting")]
                 {
                     crate::utils::crashreporting::try_report_to_sentry(&err);
                 }
-                process::exit(1);
+                1
             }
         }
-    }
+    };
+
+    // before we shut down we unbind the api to give the connection pool
+    // a chance to collect.  Not doing so has shown to cause hung threads
+    // on windows.
+    Api::dispose_pool();
+    process::exit(status_code);
 }
